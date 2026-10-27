@@ -7,22 +7,23 @@ import { createRequire } from "node:module";
 import { createModels, type OAuthCredential, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import { githubCopilotProvider } from "@earendil-works/pi-ai/providers/github-copilot";
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
+import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import type { NativeSubscriptionScope } from "../src/core/contracts/subscriptions.ts";
 const require = createRequire(import.meta.url);
 const { createSubscriptions, loadSubscriptionSDK, validEndpoint, publicError } = require("../electron/subscriptions.cjs");
 const { fileStore, validateState } = require("../electron/subscription-store.cjs");
 const { subscriptionControl } = require("../electron/subscription-ipc.cjs");
-const ids = ["github-copilot", "xai"] as const;
-const credential = (id: string, expires = Date.now() + 3600000): OAuthCredential => ({ type: "oauth", access: id === "xai" ? "fixture-xai-access" : "tid=fixture;proxy-ep=proxy.individual.githubcopilot.com;", refresh: "fixture-refresh", expires, ...(id === "github-copilot" ? { availableModelIds: [githubCopilotProvider().getModels()[0]!.id] } : {}) });
+const ids = ["github-copilot", "xai", "openai-codex"] as const;
+const credential = (id: string, expires = Date.now() + 3600000): OAuthCredential => ({ type: "oauth", access: id === "openai-codex" ? `fixture.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.fixture` : id === "xai" ? "fixture-xai-access" : "tid=fixture;proxy-ep=proxy.individual.githubcopilot.com;", refresh: "fixture-refresh", expires, ...(id === "openai-codex" ? { accountId: "fixture-account" } : {}), ...(id === "github-copilot" ? { availableModelIds: [githubCopilotProvider().getModels()[0]!.id] } : {}) });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((done) => { resolve = done; }); return { resolve, promise }; }
 async function fixture(options: { login?: (id: string, interaction: ProviderAuthInteraction) => Promise<OAuthCredential>; refresh?: (id: string, value: OAuthCredential, signal: AbortSignal) => Promise<OAuthCredential>; stores?: Record<string, unknown> } = {}) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lh-subscription-auth-"));
 	let refreshes = 0;
 	const factory = (id: string) => {
-		const native = id === "xai" ? xaiProvider() : githubCopilotProvider();
+		const native = id === "openai-codex" ? openaiCodexProvider() : id === "xai" ? xaiProvider() : githubCopilotProvider();
 		return { ...native, auth: { ...native.auth, oauth: { ...native.auth.oauth!, login: (interaction: ProviderAuthInteraction) => options.login?.(id, interaction) ?? Promise.resolve(credential(id)), refresh: async (value: OAuthCredential, signal: AbortSignal) => { refreshes++; return options.refresh?.(id, value, signal) ?? { ...credential(id), refresh: "fixture-rotated" }; } } } };
 	};
-	const sdk = { createModels, githubCopilotProvider: () => factory("github-copilot"), xaiProvider: () => factory("xai") };
+	const sdk = { createModels, githubCopilotProvider: () => factory("github-copilot"), xaiProvider: () => factory("xai"), openaiCodexProvider: () => factory("openai-codex") };
 	const updates: any[] = [], opened: string[] = [];
 	const controller = createSubscriptions({ directory, sdk, stores: options.stores, openExternal: async (url: string) => { opened.push(url); }, onChange: (snapshot: unknown) => updates.push(snapshot) });
 	await controller.ready;
@@ -35,7 +36,7 @@ async function fixture(options: { login?: (id: string, interaction: ProviderAuth
 test("main loader resolves Pi's import-only PUBLIC package exports and native OAuth without a CLI or network", async () => {
 	const sdk = await loadSubscriptionSDK(path.resolve(import.meta.dirname, ".."));
 	assert.equal(typeof sdk.createModels, "function");
-	for (const [id, factory] of [["github-copilot", sdk.githubCopilotProvider], ["xai", sdk.xaiProvider]] as const) {
+	for (const [id, factory] of [["github-copilot", sdk.githubCopilotProvider], ["xai", sdk.xaiProvider], ["openai-codex", sdk.openaiCodexProvider]] as const) {
 		const provider = factory(), store = new sdk.InMemoryCredentialStore(); await store.modify(id, () => credential(id));
 		const models = sdk.createModels({ credentials: store }); models.setProvider({ ...provider, auth: { oauth: provider.auth.oauth } });
 		const resolved = await models.getAuth(provider.getModels()[0]); assert.equal(resolved.auth.apiKey, credential(id).access);
@@ -75,6 +76,28 @@ test("parallel expired-token requests refresh once, preserve native extension me
 		const saved = JSON.parse(await fs.readFile(path.join(f.directory, "github-copilot-credentials.json"), "utf8"));
 		assert.equal(saved.credential.refresh, "rotated-single-writer"); assert.equal(saved.credential.extraNativeField, "retained");
 	} finally { await f.cleanup(); }
+});
+test("Codex refresh is single-flight, saves account metadata and isolates other connections", async () => {
+	const rotation = deferred<OAuthCredential>();
+	const f = await fixture({ login: async (id) => credential(id, 0), refresh: () => rotation.promise });
+	try {
+		await f.controller.login("openai-codex"); const scope = await f.scope("openai-codex");
+		const first = f.controller.lease(scope, false), second = f.controller.lease(scope, false);
+		await new Promise((resolve) => setImmediate(resolve));
+		rotation.resolve({ ...credential("openai-codex"), refresh: "fixture-codex-rotated" });
+		const results = await Promise.all([first, second]); assert.equal(f.refreshes, 1);
+		assert.equal(results[0].auth.apiKey, credential("openai-codex").access);
+		const saved = JSON.parse(await fs.readFile(path.join(f.directory, "openai-codex-credentials.json"), "utf8"));
+		assert.equal(saved.credential.accountId, "fixture-account"); assert.equal(saved.credential.refresh, "fixture-codex-rotated");
+		assert((await f.controller.status()).filter((s: any) => s.providerId !== "openai-codex").every((s: any) => !s.connected));
+	} finally { await f.cleanup(); }
+});
+test("Codex rejects missing account metadata and non-Codex request endpoints", () => {
+	const state = { version: 1, allowBackgroundUse: true, connectionId: "b5ac22b7-dfe3-4e52-ae0a-6da2990d4aef", credential: credential("openai-codex") };
+	for (const accountId of [undefined, "", "invalid account", 42]) assert.throws(() => validateState("openai-codex", { ...state, credential: { ...state.credential, accountId } }));
+	validateState("openai-codex", state);
+	assert(validEndpoint("openai-codex", { apiKey: state.credential.access }, state.credential));
+	for (const baseUrl of ["https://api.openai.com/v1", "https://attacker.example/backend-api", "http://chatgpt.com/backend-api", "https://chatgpt.com/backend-api?redirect=evil", "https://chatgpt.com/backend-api/other"]) assert(!validEndpoint("openai-codex", { apiKey: state.credential.access, baseUrl }, state.credential));
 });
 test("background changes retain foreground scope; replacement and disconnect invalidate old leases", async () => {
 	const f = await fixture();

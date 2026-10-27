@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
+import { zstdDecompressSync } from "node:zlib";
 import { normalizeContext, type Api, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { piModels, piEngineForSpec } from "../src/agent/models.ts";
 import { NATIVE_SUBSCRIPTIONS, type NativeSubscriptionSnapshot } from "../src/core/contracts/subscriptions.ts";
@@ -16,6 +17,7 @@ const marker = process.env.LH_DESKTOP_SERVER, secret = process.env.LH_DESKTOP_AP
 const xaiKey = process.env.XAI_API_KEY, copilotKey = process.env.COPILOT_GITHUB_TOKEN;
 let revision = 1, denied = false, sends = 0;
 const context = normalizeContext({ messages: [{ role: "user", content: "Offline fixture", timestamp: 0 }] });
+const codexAccess = `fixture.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.fixture`;
 function snapshot(background = true): NativeSubscriptionSnapshot {
 	return {
 		statuses: NATIVE_SUBSCRIPTIONS.map((p) => ({ providerId: p.providerId, available: true, connected: true, pending: false, allowBackgroundUse: background, connectionId: `fixture-${p.providerId}`, epoch: 1, authorityRevision: 1, revision })),
@@ -24,11 +26,16 @@ function snapshot(background = true): NativeSubscriptionSnapshot {
 }
 const emit = (value: unknown) => (process.emit as (event: string, value: unknown) => boolean)("message", value);
 before(async () => {
+	const codex = piModels().getProvider("openai-codex")!;
+	piModels().setProvider({ ...codex, streamSimple: (model, transcript, options) => {
+		assert.equal(options?.transport, "sse", "Codex must not bypass fetch-based admission with WebSockets");
+		return codex.streamSimple(model, transcript, options);
+	} });
 	process.env.LH_DESKTOP_SERVER = "1"; process.env.LH_DESKTOP_API_SECRET = "d".repeat(64);
 	process.env.XAI_API_KEY = "fixture-must-never-be-used"; process.env.COPILOT_GITHUB_TOKEN = "fixture-api-route-only";
 	Object.defineProperty(process, "connected", { configurable: true, value: true });
 	Object.defineProperty(process, "send", { configurable: true, value: (message: any, callback?: () => void) => {
-		sends++; queueMicrotask(() => emit({ channel: "lh:subscriptions", id: message.id, op: message.op, ...(denied && message.op === "lease" ? { ok: false, error: "fixture expired refresh" } : { ok: true, value: message.op === "snapshot" ? snapshot() : { scope: message.scope, auth: { apiKey: "fixture-oauth-only", ...(message.scope.providerId === "github-copilot" ? { baseUrl: "https://api.business.githubcopilot.com", headers: { "x-fixture-auth": "native-retained" } } : {}) } } }) }));
+		sends++; queueMicrotask(() => emit({ channel: "lh:subscriptions", id: message.id, op: message.op, ...(denied && message.op === "lease" ? { ok: false, error: "fixture expired refresh" } : { ok: true, value: message.op === "snapshot" ? snapshot() : { scope: message.scope, auth: { apiKey: message.scope.providerId === "openai-codex" ? codexAccess : "fixture-oauth-only", ...(message.scope.providerId === "github-copilot" ? { baseUrl: "https://api.business.githubcopilot.com", headers: { "x-fixture-auth": "native-retained" } } : {}) } } }) }));
 		callback?.(); return true;
 	} });
 	await refreshSubscriptionModels();
@@ -39,6 +46,7 @@ after(() => {
 	for (const [key, value] of [["LH_DESKTOP_SERVER", marker], ["LH_DESKTOP_API_SECRET", secret], ["XAI_API_KEY", xaiKey], ["COPILOT_GITHUB_TOKEN", copilotKey]]) { if (value === undefined) delete process.env[key!]; else process.env[key!] = value; }
 });
 test("logical subscription routes are separate catalog entries without rewriting native API models", () => {
+	assert(NATIVE_SUBSCRIPTIONS.some((p) => p.providerId === "openai-codex" && p.logicalId === "openai-codex-subscription"));
 	for (const p of NATIVE_SUBSCRIPTIONS) {
 		assert(nativeSubscriptionModels().some((m) => m.provider === p.logicalId));
 		assert(piModels().getModels(p.providerId).every((m) => m.provider === p.providerId));
@@ -64,10 +72,13 @@ for (const p of NATIVE_SUBSCRIPTIONS) test(`${p.providerId}: every SDK transport
 		const result = await backgroundCaptureStream(engine.streamFn, capture)(engine.model, context, {
 			onPayload: (raw, selected) => { payloadObserved = true; assert.equal(selected.provider, p.providerId); return { ...raw as object, model: "caller-cannot-replace-selected" }; },
 			fetch: async (input, init) => {
-				requests++; const request = new Request(input, init), body = await request.json(); actualBody = body;
-				assert.equal(request.headers.get("authorization"), "Bearer fixture-oauth-only");
+				requests++; const request = new Request(input, init);
+				const bytes = Buffer.from(await request.arrayBuffer());
+				const body = JSON.parse((request.headers.get("content-encoding") === "zstd" ? zstdDecompressSync(bytes) : bytes).toString()); actualBody = body;
+				assert.equal(request.headers.get("authorization"), `Bearer ${p.providerId === "openai-codex" ? codexAccess : "fixture-oauth-only"}`);
 				assert.equal(body.model, native.id);
 				if (p.providerId === "github-copilot") { assert.equal(new URL(request.url).origin, "https://api.business.githubcopilot.com"); assert.equal(request.headers.get("x-fixture-auth"), "native-retained"); }
+				else if (p.providerId === "openai-codex") { assert.equal(request.url, "https://chatgpt.com/backend-api/codex/responses"); assert.equal(request.headers.get("chatgpt-account-id"), "fixture-account"); }
 				else assert.equal(new URL(request.url).origin, "https://api.x.ai");
 				return new Response('{"error":{"message":"private-fixture-provider-detail"}}', { status: 401, headers: { "content-type": "application/json" } });
 			},
@@ -78,9 +89,25 @@ for (const p of NATIVE_SUBSCRIPTIONS) test(`${p.providerId}: every SDK transport
 		const record = JSON.parse(fs.readFileSync(path.join(dir, `researcher-${runId}.json`), "utf8"));
 		assert.deepEqual(record.request.payload, actualBody, "Observe after the selected model is enforced, not the caller replacement");
 		assert.equal(record.request.model.provider, p.logicalId);
-		assert(!JSON.stringify(record).includes("fixture-oauth-only"));
+		assert(!JSON.stringify(record).includes("fixture-oauth-only")); assert(!JSON.stringify(record).includes(codexAccess));
 		assert(!JSON.stringify(record).includes("native-retained"));
 	}
+});
+test("Codex SSE completion preserves logical identity and native usage with no transport fallback", async () => {
+	const native = piModels().getModels("openai-codex")[0]!;
+	const engine = piEngineForSpec({ provider: "openai-codex-subscription", id: native.id }, false);
+	let requests = 0;
+	const result = await engine.streamFn(engine.model, context, {
+		transport: "websocket",
+		fetch: async () => {
+			requests++;
+			const completed = { type: "response.completed", response: { id: "resp_fixture", status: "completed", output: [], usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15, input_tokens_details: { cached_tokens: 0 } } } };
+			return new Response(`data: ${JSON.stringify(completed)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+		},
+	}).result();
+	assert.equal(requests, 1); assert.equal(result.stopReason, "stop");
+	assert.equal(result.provider, "openai-codex-subscription"); assert.equal(result.model, native.id);
+	assert.equal(result.usage.input, 12); assert.equal(result.usage.output, 3);
 });
 test("failed OAuth lease never dispatches despite valid-looking ambient keys; forbidden auth overrides do not dispatch", async () => {
 	let requests = 0; denied = true;

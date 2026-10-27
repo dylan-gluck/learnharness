@@ -18,6 +18,7 @@ test("only explicit subscription route IDs count as subscription use; names stay
 	assert.equal(subscriptionLabel("chatgpt:gpt-5"), "ChatGPT");
 	assert.equal(subscriptionLabel("github-copilot-subscription:fixture"), "GitHub Copilot");
 	assert.equal(subscriptionLabel("xai-subscription:grok"), "Grok");
+	assert.equal(subscriptionLabel("openai-codex-subscription:gpt-5"), "OpenAI Codex");
 	for (const model of ["openai:gpt-5", "xai:grok", "github-copilot:fixture", "meta:muse", "radius:any", "kimi-coding:any"]) assert(!isSubscriptionModel(model));
 	assert.deepEqual(subscriptionLabels(["chatgpt:a", "xai-subscription:b", "chatgpt:c", "github-copilot-subscription:d"]), ["ChatGPT", "Grok", "GitHub Copilot"]);
 	assert.equal(planCostLabel(0.12, ["Grok"], (n) => `$${n.toFixed(2)}`), "$0.12 + Grok");
@@ -25,11 +26,11 @@ test("only explicit subscription route IDs count as subscription use; names stay
 	assert.equal(planCostLabel(null, ["ChatGPT", "GitHub Copilot", "Grok"]), "ChatGPT + GitHub Copilot + Grok");
 });
 test("mixed session pricing sums only API dollars and retains all subscription providers, not unpriced errors", () => {
-	const turns = [turn("github-copilot-subscription:gpt-5", "copilot"), turn("xai-subscription:grok", "grok"), turn("chatgpt:gpt-5", "chatgpt"), turn("openai:gpt-5", "api")];
-	const pricing = sessionCost({ turns }); assert.equal(pricing.subscription, 3); assert.equal(pricing.unpriced, 0); assert.equal(pricing.cost, callCost(step, "openai:gpt-5"));
-	assert.deepEqual(pricing.subscriptionProviders, ["GitHub Copilot", "Grok", "ChatGPT"]);
+	const turns = [turn("github-copilot-subscription:gpt-5", "copilot"), turn("xai-subscription:grok", "grok"), turn("chatgpt:gpt-5", "chatgpt"), turn("openai-codex-subscription:gpt-5", "codex"), turn("openai:gpt-5", "api")];
+	const pricing = sessionCost({ turns }); assert.equal(pricing.subscription, 4); assert.equal(pricing.unpriced, 0); assert.equal(pricing.cost, callCost(step, "openai:gpt-5"));
+	assert.deepEqual(pricing.subscriptionProviders, ["GitHub Copilot", "Grok", "ChatGPT", "OpenAI Codex"]);
 	const html = renderToStaticMarkup(<StatsBar turns={turns} pricing={pricing} />);
-	assert.match(html, /\$[\d.]+ \+ GitHub Copilot \+ Grok \+ ChatGPT/); assert(!html.includes(" API +")); assert(!html.includes("ChatGPT plan"));
+	assert.match(html, /\$[\d.]+ \+ GitHub Copilot \+ Grok \+ ChatGPT \+ OpenAI Codex/); assert(!html.includes(" API +")); assert(!html.includes("ChatGPT plan"));
 });
 test("graph stage/recent aggregates retain distinct subscription providers without inventing dollars", () => {
 	const summary = graphCostSummary({ chats: [{ title: "Fixture", extractions: [{ startedAt: 1, at: "2026-10-24T00:00:00Z", durationMs: 1, stages: { extractor: { model: "github-copilot-subscription:gpt-5", steps: [step] }, auditor: { model: "xai-subscription:grok", steps: [step] } } }] }], sources: [] }, callCost);

@@ -39,25 +39,30 @@ disabled in the packaged shell. User data remains under the existing
 `LearnHarness` application directory.
 
 When changing `package-lock.json`, update `npmDepsHash` in `nix/package.nix`.
-`prefetch-npm-deps package-lock.json` is available in the development shell.
+Each `plugins/<id>` is a separate npm project: `npm run build` compiles the core
+plugins and typechecks all of them. When a `plugins/<id>/package-lock.json`
+changes or a plugin is added, update its entry in `pluginDepsHashes`. Both
+hashes come from `prefetch-npm-deps <lockfile>`, available in the development
+shell.
 
 ## This machine's desktop integration
 
-`/home/dylan/nix/flake.nix` consumes `path:/home/dylan/fork/learnharness` and
-shares its nixpkgs input with this flake. The desktop module overrides the
-package to inject Noctalia's entry point and transparent Linux window; the
-Noctalia JavaScript, CSS, and template configuration remain in the desktop
-configuration, not this repository.
+`/home/dylan/nix/flake.nix` consumes
+`git+file:///home/dylan/fork/learnharness?ref=main` and shares its nixpkgs input
+with this flake. The desktop module overrides the package to inject Noctalia's
+entry point and transparent Linux window; the Noctalia JavaScript, CSS, and
+template configuration remain in the desktop configuration, not this
+repository.
 
-Local path inputs are **snapshots pinned by the desktop lock file**, not live
-imports. After editing this checkout, refresh that input before switching:
+The input is the committed `main` branch, **pinned by the desktop lock file**:
+uncommitted edits and other branches are not built. After merging into `main`,
+refresh that input before switching:
 
 ```sh
-nix flake update learnharness --flake path:/home/dylan/nix
-nix build path:/home/dylan/nix#learnharness
-sudo nixos-rebuild switch --flake path:/home/dylan/nix#fwp
+nix flake update learnharness --flake /home/dylan/nix
+nix build /home/dylan/nix#learnharness
+nh os switch
 ```
 
-No GitHub push is required. The first command captures local edits; the switch
-builds the themed source package if it is not already in the Nix store. Keep
-this checkout at the configured path, or update the desktop input URL.
+No GitHub push is required. Keep this checkout at the configured path, or
+update the desktop input URL.
